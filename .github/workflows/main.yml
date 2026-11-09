@@ -1,0 +1,84 @@
+name: Build Blender Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      config:
+        description: "Build configuration"
+        required: true
+        default: "lite"
+        type: choice
+        options:
+          - lite
+          - full
+      lower_minsdk:
+        description: "Lower minSdk to 30 (Android 11)"
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    # Use a larger runner if you have one (recommended)
+    # For free runners this will almost certainly fail due to disk space
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Maximize disk space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 512
+          swap-size-mb: 2048
+          remove-dotnet: true
+          remove-android: true
+          remove-haskell: true
+          remove-codeql: true
+
+      - name: Check free space
+        run: df -h
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: android
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential gcc-14 g++-14 cmake ninja-build patchelf \
+            zip unzip openjdk-17-jdk python3 git-lfs
+
+      - name: Setup Android SDK + NDK r30
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'ndk;30.0.14904198-beta1 platform-tools build-tools;35.0.1 platforms;android-35'
+
+      - name: Lower minSdk to 30 (Android 11)
+        if: ${{ inputs.lower_minsdk }}
+        run: |
+          echo "Lowering minSdkVersion to 30..."
+          find build_files/android -type f \( -name "*.xml" -o -name "*.cmake" -o -name "*.sh" -o -name "*.py" \) \
+            -exec sed -i 's/minSdkVersion="31"/minSdkVersion="30"/g' {} + || true
+          find build_files/android -type f \( -name "*.xml" -o -name "*.cmake" -o -name "*.sh" \) \
+            -exec sed -i 's/android-31/android-30/g' {} + || true
+          sed -i 's/ANDROID_API=31/ANDROID_API=30/' build_files/android/env.sh || true
+          sed -i 's/ANDROID_PLATFORM=android-31/ANDROID_PLATFORM=android-30/' build_files/android/env.sh || true
+
+      - name: Build Blender
+        run: |
+          export ANDROID_HOME=$ANDROID_SDK_ROOT
+          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+          python3 build_files/android/build.py ${{ inputs.config }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-android-${{ inputs.config }}
+          path: |
+            ../blender_build_android/android_apk_stage_*/blender-*.apk
+            **/blender-*.apk
+          retention-days: 5
+          if-no-files-found: warn
