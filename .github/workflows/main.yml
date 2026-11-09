@@ -1,84 +1,141 @@
-name: Build Blender Android
+name: Build Blender Android APK
 
 on:
   workflow_dispatch:
     inputs:
       config:
-        description: "Build configuration"
-        required: true
-        default: "lite"
+        description: "Feature set to build"
         type: choice
-        options:
-          - lite
-          - full
-      lower_minsdk:
-        description: "Lower minSdk to 30 (Android 11)"
-        required: true
-        default: true
-        type: boolean
+        options: [lite, full]
+        default: lite
+  # Uncomment to build on every push to the android branch (slow):
+  # push:
+  #   branches: [android]
+
+concurrency:
+  group: build-android-${{ github.ref }}-${{ inputs.config || 'lite' }}
+  cancel-in-progress: true
+
+env:
+  CONFIG: ${{ inputs.config || 'lite' }}
+  NDK_PACKAGE: "ndk;30.0.14904198-beta1"
+  VULKAN_HEADERS_VERSION: "1.4.341"
+  # Wrap the NDK compiler with ccache. CMake reads these from the environment,
+  # including for the nested host_tools sub-build.
+  CMAKE_C_COMPILER_LAUNCHER: ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
 
 jobs:
   build:
-    # Use a larger runner if you have one (recommended)
-    # For free runners this will almost certainly fail due to disk space
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
 
     steps:
-      - name: Maximize disk space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 512
-          swap-size-mb: 2048
-          remove-dotnet: true
-          remove-android: true
-          remove-haskell: true
-          remove-codeql: true
-
-      - name: Check free space
-        run: df -h
-
-      - name: Checkout repository
+      - name: Checkout (no LFS, no submodules)
         uses: actions/checkout@v4
         with:
-          ref: android
-          submodules: recursive
           fetch-depth: 1
+          submodules: false
+          lfs: false
 
-      - name: Install build dependencies
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost \
+                      /opt/hostedtoolcache/CodeQL /usr/local/lib/node_modules
+          sudo apt-get clean
+          df -h /
+
+      - name: Install host packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             build-essential gcc-14 g++-14 cmake ninja-build patchelf \
-            zip unzip openjdk-17-jdk python3 git-lfs
+            zip unzip git-lfs python3 curl ccache
+          cmake --version | head -1   # must be >= 3.26
+          gcc-14 --version | head -1
 
-      - name: Setup Android SDK + NDK r30
-        uses: android-actions/setup-android@v3
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
-          packages: 'ndk;30.0.14904198-beta1 platform-tools build-tools;35.0.1 platforms;android-35'
+          distribution: temurin
+          java-version: "17"
 
-      - name: Lower minSdk to 30 (Android 11)
-        if: ${{ inputs.lower_minsdk }}
-        run: |
-          echo "Lowering minSdkVersion to 30..."
-          find build_files/android -type f \( -name "*.xml" -o -name "*.cmake" -o -name "*.sh" -o -name "*.py" \) \
-            -exec sed -i 's/minSdkVersion="31"/minSdkVersion="30"/g' {} + || true
-          find build_files/android -type f \( -name "*.xml" -o -name "*.cmake" -o -name "*.sh" \) \
-            -exec sed -i 's/android-31/android-30/g' {} + || true
-          sed -i 's/ANDROID_API=31/ANDROID_API=30/' build_files/android/env.sh || true
-          sed -i 's/ANDROID_PLATFORM=android-31/ANDROID_PLATFORM=android-30/' build_files/android/env.sh || true
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: android-${{ env.CONFIG }}
+          max-size: 2G
 
-      - name: Build Blender
+      - name: Install Android SDK components and NDK r30 beta
         run: |
-          export ANDROID_HOME=$ANDROID_SDK_ROOT
-          export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-          python3 build_files/android/build.py ${{ inputs.config }}
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --channel=1 \
+            "$NDK_PACKAGE" "platform-tools" \
+            "build-tools;35.0.1" "platforms;android-35"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: Fetch LFS content and host library submodule
+        run: |
+          git config lfs.url https://projects.blender.org/blender/blender.git/info/lfs
+          # Public content: answer the credential prompt with empty credentials,
+          # scoped to this host only.
+          git config --local credential.https://projects.blender.org.helper \
+            '!f() { echo username=; echo password=; }; f'
+          git lfs install --local
+          git lfs pull
+
+          HOST_LIB=lib/linux_x64
+          git -c submodule.$HOST_LIB.update=checkout \
+              submodule update --init "$HOST_LIB"
+
+      - name: Fetch prebuilt Android dependencies
+        run: git submodule update --init lib/android_arm64
+
+      - name: Provide Vulkan headers
+        run: |
+          BUILD_BASE="$(realpath "$GITHUB_WORKSPACE/..")/blender_build_android"
+          echo "BUILD_BASE=$BUILD_BASE" >> "$GITHUB_ENV"
+          mkdir -p "$BUILD_BASE/lib/vulkan_headers"
+          curl -fL -o /tmp/vh.tar.gz \
+            "https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v${VULKAN_HEADERS_VERSION}.tar.gz"
+          tar -xzf /tmp/vh.tar.gz -C /tmp
+          cp -R "/tmp/Vulkan-Headers-${VULKAN_HEADERS_VERSION}/include" \
+                "$BUILD_BASE/lib/vulkan_headers/include"
+
+      - name: Build host tools, libblender.so and APK
+        run: |
+          df -h /
+          build_files/android/build_apk.sh "$CONFIG"
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s || true
+
+      - name: Locate APK
+        id: apk
+        run: |
+          APK="$BUILD_BASE/android_apk_stage_${CONFIG}/blender-${CONFIG}.apk"
+          ls -lh "$APK"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: blender-android-${{ inputs.config }}
+          name: blender-${{ env.CONFIG }}-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0   # an APK is already compressed
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ env.CONFIG }}
           path: |
-            ../blender_build_android/android_apk_stage_*/blender-*.apk
-            **/blender-*.apk
-          retention-days: 5
-          if-no-files-found: warn
+            ${{ env.BUILD_BASE }}/build_android_${{ env.CONFIG }}/.ninja_log
+            ${{ env.BUILD_BASE }}/build_android_${{ env.CONFIG }}/CMakeFiles/CMakeError.log
+            ${{ env.BUILD_BASE }}/build_host_tools_${{ env.CONFIG }}/.ninja_log
+          if-no-files-found: ignore
